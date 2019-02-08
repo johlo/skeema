@@ -10,9 +10,10 @@ type Schema struct {
 	CharSet   string
 	Collation string
 	Tables    []*Table
+	Routines  []*Routine
 }
 
-// TablesByName returns a mapping of table names to Table struct values, for
+// TablesByName returns a mapping of table names to Table struct pointers, for
 // all tables in the schema.
 func (s *Schema) TablesByName() map[string]*Table {
 	if s == nil {
@@ -40,6 +41,31 @@ func (s *Schema) Table(name string) *Table {
 		}
 	}
 	return nil
+}
+
+// ProceduresByName returns a mapping of stored procedure names to Routine
+// struct pointers, for all stored procedures in the schema.
+func (s *Schema) ProceduresByName() map[string]*Routine {
+	return s.routinesByNameAndType(RoutineTypeProc)
+}
+
+// FunctionsByName returns a mapping of function names to Routine struct
+// pointers, for all functions in the schema.
+func (s *Schema) FunctionsByName() map[string]*Routine {
+	return s.routinesByNameAndType(RoutineTypeFunc)
+}
+
+func (s *Schema) routinesByNameAndType(rType RoutineType) map[string]*Routine {
+	if s == nil {
+		return map[string]*Routine{}
+	}
+	result := make(map[string]*Routine, len(s.Routines))
+	for _, r := range s.Routines {
+		if r.Type == rType {
+			result[r.Name] = r
+		}
+	}
+	return result
 }
 
 // Diff returns the set of differences between this schema and another schema.

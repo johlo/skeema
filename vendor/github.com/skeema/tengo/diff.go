@@ -79,10 +79,12 @@ type StatementModifiers struct {
 // SchemaDiff represents a set of differences between two database schemas,
 // encapsulating diffs of various different object types.
 type SchemaDiff struct {
-	FromSchema *Schema
-	ToSchema   *Schema
-	TableDiffs []*TableDiff // a set of statements that, if run, would turn tables in FromSchema into ToSchema
-	SameTables []*Table     // slice of tables that were identical between schemas
+	FromSchema   *Schema
+	ToSchema     *Schema
+	TableDiffs   []*TableDiff   // a set of statements that, if run, would turn tables in FromSchema into ToSchema
+	RoutineDiffs []*RoutineDiff // " but for funcs and procs
+	SameTables   []*Table       // slice of tables that were identical between schemas
+	SameRoutines []*Routine     // " but for funcs and procs
 }
 
 // NewSchemaDiff computes the set of differences between two database schemas.
@@ -90,47 +92,44 @@ func NewSchemaDiff(from, to *Schema) *SchemaDiff {
 	result := &SchemaDiff{
 		FromSchema: from,
 		ToSchema:   to,
-		TableDiffs: make([]*TableDiff, 0),
-		SameTables: make([]*Table, 0),
 	}
 
 	if from == nil && to == nil {
 		return result
 	}
 
-	fromTablesByName := from.TablesByName()
-	toTablesByName := to.TablesByName()
+	result.TableDiffs, result.SameTables = compareTables(from, to)
+	result.RoutineDiffs, result.SameRoutines = compareRoutines(from, to)
+	return result
+}
 
-	if to != nil {
-		for n := range to.Tables {
-			newTable := to.Tables[n]
-			if _, existedBefore := fromTablesByName[newTable.Name]; !existedBefore {
-				result.TableDiffs = append(result.TableDiffs, NewCreateTable(newTable))
+func compareTables(from, to *Schema) (tableDiffs []*TableDiff, sameTables []*Table) {
+	fromByName := from.TablesByName()
+	toByName := to.TablesByName()
+	addFKAlters := make([]*TableDiff, 0)
+
+	for name, fromTable := range fromByName {
+		toTable, stillExists := toByName[name]
+		if !stillExists {
+			tableDiffs = append(tableDiffs, NewDropTable(fromTable))
+			continue
+		}
+		td := NewAlterTable(fromTable, toTable)
+		if td == nil { // tables are the same
+			sameTables = append(sameTables, toTable)
+		} else {
+			otherAlter, addFKAlter := td.SplitAddForeignKeys()
+			if otherAlter != nil {
+				tableDiffs = append(tableDiffs, otherAlter)
+			}
+			if addFKAlter != nil {
+				addFKAlters = append(addFKAlters, addFKAlter)
 			}
 		}
 	}
-
-	addFKAlters := make([]*TableDiff, 0)
-	if from != nil {
-		for n := range from.Tables {
-			origTable := from.Tables[n]
-			newTable, stillExists := toTablesByName[origTable.Name]
-			if stillExists {
-				td := NewAlterTable(origTable, newTable)
-				if td == nil { // tables are the same
-					result.SameTables = append(result.SameTables, newTable)
-				} else {
-					otherAlter, addFKAlter := td.SplitAddForeignKeys()
-					if otherAlter != nil {
-						result.TableDiffs = append(result.TableDiffs, otherAlter)
-					}
-					if addFKAlter != nil {
-						addFKAlters = append(addFKAlters, addFKAlter)
-					}
-				}
-			} else {
-				result.TableDiffs = append(result.TableDiffs, NewDropTable(origTable))
-			}
+	for name, toTable := range toByName {
+		if _, alreadyExists := fromByName[name]; !alreadyExists {
+			tableDiffs = append(tableDiffs, NewCreateTable(toTable))
 		}
 	}
 
@@ -138,9 +137,37 @@ func NewSchemaDiff(from, to *Schema) *SchemaDiff {
 	// on tables, columns, or indexes that are being newly created earlier in the
 	// diff. (This is not a comprehensive solution yet though, since FKs can refer
 	// to other schemas, and NewSchemaDiff only operates within one schema.)
-	result.TableDiffs = append(result.TableDiffs, addFKAlters...)
+	tableDiffs = append(tableDiffs, addFKAlters...)
+	return
+}
 
-	return result
+func compareRoutines(from, to *Schema) (routineDiffs []*RoutineDiff, sameRoutines []*Routine) {
+	// TODO: Currently this handles all changes to existing routines via DROP-then-
+	// ADD, but some metadata-only changes could use ALTER FUNCTION / ALTER
+	// PROCEDURE instead.
+	compare := func(fromByName map[string]*Routine, toByName map[string]*Routine) {
+		for name, fromRoutine := range fromByName {
+			toRoutine, stillExists := toByName[name]
+			if !stillExists || !fromRoutine.Equals(toRoutine) {
+				routineDiffs = append(routineDiffs, &RoutineDiff{From: fromRoutine})
+			}
+			if stillExists {
+				if fromRoutine.Equals(toRoutine) {
+					sameRoutines = append(sameRoutines, toRoutine)
+				} else {
+					routineDiffs = append(routineDiffs, &RoutineDiff{To: toRoutine})
+				}
+			}
+		}
+		for name, toRoutine := range toByName {
+			if _, alreadyExists := fromByName[name]; !alreadyExists {
+				routineDiffs = append(routineDiffs, &RoutineDiff{To: toRoutine})
+			}
+		}
+	}
+	compare(from.ProceduresByName(), to.ProceduresByName())
+	compare(from.FunctionsByName(), to.FunctionsByName())
+	return
 }
 
 // DatabaseDiff returns an object representing database-level DDL (CREATE
@@ -155,9 +182,9 @@ func (sd *SchemaDiff) DatabaseDiff() *DatabaseDiff {
 }
 
 // ObjectDiffs returns a slice of all ObjectDiffs in the SchemaDiff. The results
-// results are returned in a sorted order, such that the diffs' Statements are
-// legal. For example, if a CREATE DATABASE is present, it will occur in the
-// slice prior to any table-level DDL in that schema.
+// are returned in a sorted order, such that the diffs' Statements are legal.
+// For example, if a CREATE DATABASE is present, it will occur in the slice
+// prior to any table-level DDL in that schema.
 func (sd *SchemaDiff) ObjectDiffs() []ObjectDiff {
 	result := make([]ObjectDiff, 0)
 	dd := sd.DatabaseDiff()
@@ -167,10 +194,17 @@ func (sd *SchemaDiff) ObjectDiffs() []ObjectDiff {
 	for _, td := range sd.TableDiffs {
 		result = append(result, td)
 	}
+	for _, rd := range sd.RoutineDiffs {
+		result = append(result, rd)
+	}
 	return result
 }
 
 // String returns the set of differences between two schemas as a single string.
+// In building this string representation, note that no statement modifiers are
+// applied, and any errors from Statement() are ignored. This means the returned
+// string may contain destructive statements, and should only be used for
+// display purposes, not for DDL execution.
 func (sd *SchemaDiff) String() string {
 	allDiffs := sd.ObjectDiffs()
 	diffStatements := make([]string, len(allDiffs))
@@ -424,7 +458,7 @@ func (td *TableDiff) Statement(mods StatementModifiers) (string, error) {
 			}
 		}
 		return stmt, err
-	default: // TableDiffRename not supported yet
+	default: // DiffTypeRename not supported yet
 		panic(fmt.Errorf("Unsupported diff type %d", td.Type))
 	}
 }
@@ -447,7 +481,7 @@ func (td *TableDiff) Clauses(mods StatementModifiers) (string, error) {
 		return strings.Replace(stmt, prefix, "", 1), err
 	case DiffTypeDrop:
 		return "", err
-	default: // TableDiffRename not supported yet
+	default: // DiffTypeRename not supported yet
 		panic(fmt.Errorf("Unsupported diff type %d", td.Type))
 	}
 }
@@ -517,6 +551,72 @@ func (td *TableDiff) alterStatement(mods StatementModifiers) (string, error) {
 		fde.Statement = stmt
 	}
 	return stmt, err
+}
+
+///// RoutineDiff //////////////////////////////////////////////////////////////
+
+// RoutineDiff represents a difference between two routines.
+type RoutineDiff struct {
+	From *Routine
+	To   *Routine
+}
+
+// ObjectType returns the type of the object being diff'ed, which will be either
+// "function" or "procedure" for a RoutineDiff
+func (rd *RoutineDiff) ObjectType() string {
+	if rd != nil && rd.From != nil {
+		return string(rd.From.Type)
+	} else if rd != nil && rd.To != nil {
+		return string(rd.To.Type)
+	}
+	return "routine"
+}
+
+// ObjectName returns the name of the object being diff'ed.
+func (rd *RoutineDiff) ObjectName() string {
+	if rd != nil && rd.From != nil {
+		return rd.From.Name
+	} else if rd != nil && rd.To != nil {
+		return rd.To.Name
+	}
+	return ""
+}
+
+// DiffType returns the type of diff operation.
+func (rd *RoutineDiff) DiffType() DiffType {
+	if rd == nil || (rd.To == nil && rd.From == nil) {
+		return DiffTypeNone
+	} else if rd.To == nil {
+		return DiffTypeDrop
+	} else if rd.From == nil {
+		return DiffTypeCreate
+	}
+	return DiffTypeAlter
+}
+
+// Statement returns the full DDL statement corresponding to the RoutineDiff. A
+// blank string may be returned if the mods indicate the statement should be
+// skipped. If the mods indicate the statement should be disallowed, it will
+// still be returned as-is, but the error will be non-nil. Be sure not to
+// ignore the error value of this method.
+func (rd *RoutineDiff) Statement(mods StatementModifiers) (string, error) {
+	switch rd.DiffType() {
+	case DiffTypeNone:
+		return "", nil
+	case DiffTypeCreate:
+		return rd.To.CreateStatement, nil
+	case DiffTypeDrop:
+		var err error
+		if !mods.AllowUnsafe {
+			err = &ForbiddenDiffError{
+				Reason:    fmt.Sprintf("DROP %s not permitted", rd.From.Type.Caps()),
+				Statement: rd.From.DropStatement(),
+			}
+		}
+		return rd.From.DropStatement(), err
+	default: // DiffTypeAlter and DiffTypeRename not supported yet
+		return "", fmt.Errorf("Unsupported diff type %d", rd.DiffType())
+	}
 }
 
 ///// Errors ///////////////////////////////////////////////////////////////////
