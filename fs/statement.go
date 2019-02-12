@@ -9,6 +9,9 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/alecthomas/participle"
+	"github.com/alecthomas/participle/lexer"
 )
 
 // StatementType indicates the type of a SQL statement found in a SQLFile.
@@ -268,67 +271,64 @@ func (ls *lineState) doneStatement(omitEndBytes int) {
 }
 
 func (ls *lineState) parseStatement() {
-	if !ls.inRelevant || ls.stmt.Text[0] == ';' {
+	txt := strings.TrimRight(ls.stmt.Text, ";\n\t ")
+	if !ls.inRelevant || txt == "" {
 		ls.stmt.Type = StatementTypeNoop
-	} else if ok, idents := hasPrefix(ls.stmt.Text, "use ?"); ok {
-		ls.stmt.Type = StatementTypeUse
-		ls.defaultDatabase = idents[0]
-	} else if ok, idents := hasPrefix(ls.stmt.Text, "create table if not exists ?"); ok {
-		ls.stmt.Type = StatementTypeCreateTable
-		ls.stmt.TableName = idents[0]
-	} else if ok, idents := hasPrefix(ls.stmt.Text, "create table ?"); ok {
-		ls.stmt.Type = StatementTypeCreateTable
-		ls.stmt.TableName = idents[0]
+	} else {
+		sqlStatement := &SQLStatement{}
+		if err := nameParser.ParseString(txt, sqlStatement); err != nil {
+			return
+		} else if sqlStatement.Use != nil {
+			ls.stmt.Type = StatementTypeUse
+			ls.defaultDatabase = stripBackticks(sqlStatement.Use.DefaultDatabase)
+		} else if sqlStatement.CreateTable != nil {
+			ls.stmt.Type = StatementTypeCreateTable
+			ls.stmt.TableName = stripBackticks(sqlStatement.CreateTable.Name.Table)
+		}
 	}
 }
 
-var reStripCComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
-var reStripLineComment = regexp.MustCompile(`((--\s)|#)[^\n]*`)
-
-// hasPrefix determines if, after ignoring comments and whitespace, s begins
-// with the supplied prefix. Comparison is case-insensitive. Any `?` characters
-// in the prefix are interpretted as identifiers, which will be captured and
-// returned. Any identifiers that are backtick-wrapped will have their backticks
-// removed prior to returning.
-// TODO: Support identifiers that include a schema name, which may or may not
-// independently be wrapped in backticks too
-// TODO: This implementation is rudimentary and does not properly handle several
-// rare edge cases with backtick-wrapped identifiers containing start-of-quote chars,
-// escaped backticks, or multiple adjacent whitespace characters. Non-urgent
-// since these rarely have legitimate use in MySQL identifiers!
-func hasPrefix(s, prefix string) (has bool, identifiers []string) {
-	prefixTokens := strings.Split(prefix, " ")
-
-	s = strings.TrimSpace(s)
-	if s[len(s)-1] == ';' {
-		s = s[0 : len(s)-1]
+func stripBackticks(input string) string {
+	if input[0] != '`' || input[len(input)-1] != '`' {
+		return input
 	}
-	s = reStripCComment.ReplaceAllLiteralString(s, "")
-	s = reStripLineComment.ReplaceAllLiteralString(s, "")
+	input = input[1 : len(input)-1]
+	return strings.Replace(input, "``", "`", -1)
+}
 
-	tokens := strings.FieldsFunc(s, unicode.IsSpace)
-	var i, j int
-	for i < len(prefixTokens) && j < len(tokens) {
-		if prefixTokens[i] == "?" {
-			if tokens[j][0] == '`' {
-				start := j
-				for tokens[j][len(tokens[j])-1] != '`' {
-					j++
-					if j >= len(tokens) {
-						return false, nil
-					}
-				}
-				ident := strings.Join(tokens[start:j+1], " ")
-				identifiers = append(identifiers, ident[1:len(ident)-1])
-			} else {
-				identifiers = append(identifiers, tokens[j])
-			}
-		} else if strings.ToLower(prefixTokens[i]) != strings.ToLower(tokens[j]) {
-			return false, nil
-		}
-		i++
-		j++
-	}
+var (
+	sqlLexer = lexer.Must(lexer.Regexp(`(#[^\n]+(?:\n|$))` +
+		`|(--\s[^\n]+(?:\n|$))` +
+		`|(/\*(.|\n)*?\*/)` +
+		`|(\s+)` +
+		"|(?P<Word>[0-9a-zA-Z$_]+|`(?:[^`]|``)+`)" +
+		`|(?P<String>'(?:[^']|''|\')*'|"(?:[^"]|""|\")*")` +
+		`|(?P<Number>[-+]?\d*\.?\d+([eE][-+]?\d+)?)` +
+		`|(?P<Operator><>|!=|<=|>=|[-+*/%,.()=<>])`,
+	))
+	nameParser = participle.MustBuild(&SQLStatement{}, participle.Lexer(sqlLexer), participle.CaseInsensitive("Word"))
+)
 
-	return i == len(prefixTokens), identifiers
+// SQLStatement is the top-level struct for the name parser.
+type SQLStatement struct {
+	CreateTable *CreateTable `parser:"@@"`
+	Use         *Use         `parser:"| @@"`
+}
+
+// TableName represents the name of a table, which may or may not be backtick-
+// wrapped, and may or may not be qualified with a schema name (also potentially
+// backtick-wrapped).
+type TableName struct {
+	Schema string `parser:"(@Word '.')?"`
+	Table  string `parser:"@Word"`
+}
+
+// CreateTable represents a CREATE TABLE statement.
+type CreateTable struct {
+	Name *TableName `parser:"'CREATE' 'TABLE' ('IF' 'NOT' 'EXISTS')? @@ (Word | String | Number | Operator)*"`
+}
+
+// Use represents a USE command.
+type Use struct {
+	DefaultDatabase string `parser:"'USE' @Word"`
 }
