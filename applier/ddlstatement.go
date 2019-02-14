@@ -34,21 +34,18 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 		schemaName: target.SchemaFromDir.Name,
 	}
 
-	var isTable bool
 	var tableSize int64
-
-	switch diff := diff.(type) {
-	case *tengo.DatabaseDiff:
+	otype := diff.ObjectKey().Type
+	switch otype {
+	case tengo.ObjectTypeDatabase:
 		// Don't run database-level DDL in a schema; not even possible for CREATE
 		// DATABASE anyway
 		ddl.schemaName = ""
-
-	case *tengo.TableDiff:
-		isTable = true
+	case tengo.ObjectTypeTable:
 		// Obtain table size only if actually needed
 		needSize := anyOptChanged(target, "safe-below-size", "alter-wrapper-min-size") || wrapperUsesSize(target, "alter-wrapper", "ddl-wrapper")
 		if diff.DiffType() != tengo.DiffTypeCreate && needSize {
-			if tableSize, err = ddl.getTableSize(target, diff.From); err != nil {
+			if tableSize, err = ddl.getTableSize(target, diff.(*tengo.TableDiff).From); err != nil {
 				return nil, err
 			}
 		}
@@ -60,14 +57,14 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 	if err != nil {
 		return nil, err
 	}
-	if isTable && tableSize < int64(safeBelowSize) {
+	if otype == tengo.ObjectTypeTable && tableSize < int64(safeBelowSize) {
 		mods.AllowUnsafe = true
-		log.Debugf("Allowing unsafe operations for table %s: size=%d < safe-below-size=%d", diff.ObjectName(), tableSize, safeBelowSize)
+		log.Debugf("Allowing unsafe operations for %s: size=%d < safe-below-size=%d", diff.ObjectKey(), tableSize, safeBelowSize)
 	}
 
 	// Options may indicate some/all DDL gets executed by shelling out to another program.
 	wrapper := target.Dir.Config.Get("ddl-wrapper")
-	if isTable && diff.DiffType() == tengo.DiffTypeAlter && target.Dir.Config.Changed("alter-wrapper") {
+	if otype == tengo.ObjectTypeTable && diff.DiffType() == tengo.DiffTypeAlter && target.Dir.Config.Changed("alter-wrapper") {
 		minSize, err := target.Dir.Config.GetBytes("alter-wrapper-min-size")
 		if err != nil {
 			return nil, err
@@ -81,7 +78,7 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 			// external OSC tool for large tables, without risk of ALGORITHM or LOCK
 			// clauses breaking expectations of the OSC tool.
 			if minSize > 0 {
-				log.Debugf("Using alter-wrapper for table %s: size=%d >= alter-wrapper-min-size=%d", diff.ObjectName(), tableSize, minSize)
+				log.Debugf("Using alter-wrapper for %s: size=%d >= alter-wrapper-min-size=%d", diff.ObjectKey(), tableSize, minSize)
 				if mods.AlgorithmClause != "" || mods.LockClause != "" {
 					log.Debug("Ignoring --alter-algorithm and --alter-lock for generating DDL for alter-wrapper")
 					mods.AlgorithmClause = ""
@@ -89,7 +86,7 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 				}
 			}
 		} else {
-			log.Debugf("Skipping alter-wrapper for table %s: size=%d < alter-wrapper-min-size=%d", diff.ObjectName(), tableSize, minSize)
+			log.Debugf("Skipping alter-wrapper for %s: size=%d < alter-wrapper-min-size=%d", diff.ObjectKey(), tableSize, minSize)
 		}
 	}
 
@@ -106,7 +103,7 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 	}
 
 	// If adding foreign key constraints, use foreign_key_checks=1 if requested
-	if wrapper == "" && isTable && diff.DiffType() == tengo.DiffTypeAlter &&
+	if wrapper == "" && otype == tengo.ObjectTypeTable && diff.DiffType() == tengo.DiffTypeAlter &&
 		strings.Contains(ddl.stmt, "ADD CONSTRAINT") &&
 		strings.Contains(ddl.stmt, "FOREIGN KEY") &&
 		target.Dir.Config.GetBool("foreign-key-checks") {
@@ -134,16 +131,16 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 			"ENVIRONMENT": target.Dir.Config.Get("environment"),
 			"DDL":         ddl.stmt,
 			"CLAUSES":     "", // filled in below only for tables
-			"NAME":        diff.ObjectName(),
+			"NAME":        diff.ObjectKey().Name,
 			"TABLE":       "", // filled in below only for tables
 			"SIZE":        strconv.FormatInt(tableSize, 10),
 			"TYPE":        diff.DiffType().String(),
-			"CLASS":       strings.ToUpper(diff.ObjectType()),
+			"CLASS":       otype.Caps(),
 			"CONNOPTS":    connOpts,
 			"DIRNAME":     target.Dir.BaseName(),
 			"DIRPATH":     target.Dir.Path,
 		}
-		if isTable {
+		if otype == tengo.ObjectTypeTable {
 			td := diff.(*tengo.TableDiff)
 			variables["CLAUSES"], _ = td.Clauses(mods)
 			variables["TABLE"] = variables["NAME"]

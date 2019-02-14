@@ -5,28 +5,13 @@ import (
 	"strings"
 )
 
-// RoutineType distinguishes between stored procedures and functions
-type RoutineType string
-
-// Constants enumerating valid routine types
-const (
-	RoutineTypeProc RoutineType = "procedure"
-	RoutineTypeFunc RoutineType = "function"
-)
-
-// Caps returns the routine type as an all-caps string, e.g. "PROCEDURE" or
-// "FUNCTION".
-func (r RoutineType) Caps() string {
-	return strings.ToUpper(string(r))
-}
-
 // Routine represents a stored procedure or function.
 type Routine struct {
 	Name              string
-	Type              RoutineType
-	Body              string // From information_schema; different char escaping vs CreateStatement
-	ParamString       string // Formatted as per original CREATE
-	ReturnDataType    string // Includes charset/collation when relevant
+	Type              ObjectType // Will be ObjectTypeProcedure or ObjectTypeFunction
+	Body              string     // From information_schema; different char escaping vs CreateStatement
+	ParamString       string     // Formatted as per original CREATE
+	ReturnDataType    string     // Includes charset/collation when relevant
 	Definer           string
 	DatabaseCollation string // from creation time
 	Comment           string
@@ -46,7 +31,7 @@ func (r *Routine) Definition(_ Flavor) string {
 	if atPos >= 0 {
 		definer = fmt.Sprintf("%s@%s", EscapeIdentifier(r.Definer[0:atPos]), EscapeIdentifier(r.Definer[atPos+1:]))
 	}
-	if r.Type == RoutineTypeFunc {
+	if r.Type == ObjectTypeFunc {
 		returnClause = fmt.Sprintf(" RETURNS %s", r.ReturnDataType)
 	}
 

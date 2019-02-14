@@ -46,26 +46,47 @@ func (s *Schema) Table(name string) *Table {
 // ProceduresByName returns a mapping of stored procedure names to Routine
 // struct pointers, for all stored procedures in the schema.
 func (s *Schema) ProceduresByName() map[string]*Routine {
-	return s.routinesByNameAndType(RoutineTypeProc)
+	return s.routinesByNameAndType(ObjectTypeProc)
 }
 
 // FunctionsByName returns a mapping of function names to Routine struct
 // pointers, for all functions in the schema.
 func (s *Schema) FunctionsByName() map[string]*Routine {
-	return s.routinesByNameAndType(RoutineTypeFunc)
+	return s.routinesByNameAndType(ObjectTypeFunc)
 }
 
-func (s *Schema) routinesByNameAndType(rType RoutineType) map[string]*Routine {
+func (s *Schema) routinesByNameAndType(ot ObjectType) map[string]*Routine {
 	if s == nil {
 		return map[string]*Routine{}
 	}
 	result := make(map[string]*Routine, len(s.Routines))
 	for _, r := range s.Routines {
-		if r.Type == rType {
+		if r.Type == ot {
 			result[r.Name] = r
 		}
 	}
 	return result
+}
+
+// ObjectDefinitions returns a mapping of ObjectKey (type+name) to an SQL string
+// containing the corresponding CREATE statement, for all supported object types
+// in the schema.
+// Note that the returned map does NOT include an entry for the schema itself.
+func (s *Schema) ObjectDefinitions() map[ObjectKey]string {
+	dict := make(map[ObjectKey]string)
+	for name, table := range s.TablesByName() {
+		key := ObjectKey{Type: ObjectTypeTable, Name: name}
+		dict[key] = table.CreateStatement
+	}
+	for name, procedure := range s.ProceduresByName() {
+		key := ObjectKey{Type: ObjectTypeProc, Name: name}
+		dict[key] = procedure.CreateStatement
+	}
+	for name, function := range s.FunctionsByName() {
+		key := ObjectKey{Type: ObjectTypeFunc, Name: name}
+		dict[key] = function.CreateStatement
+	}
+	return dict
 }
 
 // Diff returns the set of differences between this schema and another schema.

@@ -161,7 +161,7 @@
   branch = "routines"
   name = "github.com/skeema/tengo"
   packages = ["."]
-  revision = "e1442024cbaa94f8cec383c93fc8640f46186316"
+  revision = "dc2cb8f5b4167a1625ef61419b0a25b0c54353d3"
 
 [[projects]]
   branch = "master"

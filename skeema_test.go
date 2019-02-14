@@ -244,14 +244,14 @@ func (s *SkeemaIntegrationSuite) verifyFiles(t *testing.T, cfg *mybase.Config, d
 		if len(a.LogicalSchemas) != len(b.LogicalSchemas) {
 			t.Errorf("Mismatch between count of parsed logical schemas: %s=%d vs %s=%d", a, len(a.LogicalSchemas), b, len(b.LogicalSchemas))
 		} else if len(a.LogicalSchemas) > 0 {
-			aCreates, bCreates := a.LogicalSchemas[0].CreateTables, b.LogicalSchemas[0].CreateTables
+			aCreates, bCreates := a.LogicalSchemas[0].Creates, b.LogicalSchemas[0].Creates
 			if len(aCreates) != len(bCreates) {
-				t.Errorf("Mismatch in CREATE TABLE count: %s=%d, %s=%d", a, len(aCreates), b, len(bCreates))
+				t.Errorf("Mismatch in CREATE count: %s=%d, %s=%d", a, len(aCreates), b, len(bCreates))
 			} else {
-				for name, aStmt := range aCreates {
-					bStmt := bCreates[name]
-					if aStmt.Text != bStmt.Text {
-						t.Errorf("Mismatch for table %s:\n%s:\n%s\n\n%s:\n%s\n", name, aStmt.Location(), aStmt.Text, bStmt.Location(), bStmt.Text)
+				for key, aCreate := range aCreates {
+					bCreate := bCreates[key]
+					if aCreate.Text != bCreate.Text {
+						t.Errorf("Mismatch for %v:\n%s\n%s\n", key, aCreate.Text, bCreate.Text)
 					}
 				}
 			}

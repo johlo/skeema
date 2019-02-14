@@ -12,6 +12,7 @@ import (
 
 	"github.com/alecthomas/participle"
 	"github.com/alecthomas/participle/lexer"
+	"github.com/skeema/tengo"
 )
 
 // StatementType indicates the type of a SQL statement found in a SQLFile.
@@ -24,8 +25,8 @@ const (
 	StatementTypeUnknown StatementType = iota
 	StatementTypeNoop                  // entirely whitespace and/or comments
 	StatementTypeUse
-	StatementTypeCreateTable
-	StatementTypeAlterTable
+	StatementTypeCreate
+	StatementTypeAlter
 	// Other types will be added once they are supported by the package
 )
 
@@ -39,7 +40,9 @@ type Statement struct {
 	Text            string
 	DefaultDatabase string // only populated if a StatementTypeUse was encountered
 	Type            StatementType
-	TableName       string // only populated for Types relating to Tables
+	ObjectType      tengo.ObjectType
+	ObjectName      string
+	ObjectQualifier string
 	FromFile        *TokenizedSQLFile
 }
 
@@ -53,6 +56,23 @@ func (stmt *Statement) Location() string {
 		return fmt.Sprintf("unknown:%d:%d", stmt.LineNo, stmt.CharNo)
 	}
 	return fmt.Sprintf("%s:%d:%d", stmt.File, stmt.LineNo, stmt.CharNo)
+}
+
+// ObjectKey returns a tengo.ObjectKey for the object affected by this
+// statement.
+func (stmt *Statement) ObjectKey() tengo.ObjectKey {
+	return tengo.ObjectKey{
+		Type: stmt.ObjectType,
+		Name: stmt.ObjectName,
+	}
+}
+
+// Schema returns the schema name that this statement impacts.
+func (stmt *Statement) Schema() string {
+	if stmt.ObjectQualifier != "" {
+		return stmt.ObjectQualifier
+	}
+	return stmt.DefaultDatabase
 }
 
 var reSplitTextBody = regexp.MustCompile(`(\s*;?\s*)$`)
@@ -282,8 +302,17 @@ func (ls *lineState) parseStatement() {
 			ls.stmt.Type = StatementTypeUse
 			ls.defaultDatabase = stripBackticks(sqlStatement.Use.DefaultDatabase)
 		} else if sqlStatement.CreateTable != nil {
-			ls.stmt.Type = StatementTypeCreateTable
-			ls.stmt.TableName = stripBackticks(sqlStatement.CreateTable.Name.Table)
+			ls.stmt.Type = StatementTypeCreate
+			ls.stmt.ObjectType = tengo.ObjectTypeTable
+			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStatement.CreateTable.Name.SchemaAndTable()
+		} else if sqlStatement.CreateProc != nil {
+			ls.stmt.Type = StatementTypeCreate
+			ls.stmt.ObjectType = tengo.ObjectTypeProc
+			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStatement.CreateProc.Name.SchemaAndTable()
+		} else if sqlStatement.CreateFunc != nil {
+			ls.stmt.Type = StatementTypeCreate
+			ls.stmt.ObjectType = tengo.ObjectTypeFunc
+			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStatement.CreateFunc.Name.SchemaAndTable()
 		}
 	}
 }
@@ -304,28 +333,71 @@ var (
 		"|(?P<Word>[0-9a-zA-Z$_]+|`(?:[^`]|``)+`)" +
 		`|(?P<String>'(?:[^']|''|\')*'|"(?:[^"]|""|\")*")` +
 		`|(?P<Number>[-+]?\d*\.?\d+([eE][-+]?\d+)?)` +
-		`|(?P<Operator><>|!=|<=|>=|[-+*/%,.()=<>])`,
+		`|(?P<Operator><>|!=|<=|>=|[-+*/%,.()=<>@])`,
 	))
-	nameParser = participle.MustBuild(&SQLStatement{}, participle.Lexer(sqlLexer), participle.CaseInsensitive("Word"))
+	nameParser = participle.MustBuild(&SQLStatement{},
+		participle.Lexer(sqlLexer),
+		participle.CaseInsensitive("Word"),
+		participle.UseLookahead(10),
+	)
 )
 
 // SQLStatement is the top-level struct for the name parser.
 type SQLStatement struct {
 	CreateTable *CreateTable `parser:"@@"`
+	CreateProc  *CreateProc  `parser:"| @@"`
+	CreateFunc  *CreateFunc  `parser:"| @@"`
 	Use         *Use         `parser:"| @@"`
 }
 
-// TableName represents the name of a table, which may or may not be backtick-
-// wrapped, and may or may not be qualified with a schema name (also potentially
-// backtick-wrapped).
-type TableName struct {
-	Schema string `parser:"(@Word '.')?"`
-	Table  string `parser:"@Word"`
+// ObjectName represents the name of an object, which may or may not be
+// backtick-wrapped, and may or may not have multiple qualifier parts (each
+// also potentially backtick-wrapped).
+type ObjectName struct {
+	Qualifiers []string `parser:"(@Word '.')*"`
+	Name       string   `parser:"@Word"`
+}
+
+// SchemaAndTable interprets the ObjectName as a table name which may optionally
+// have a schema name qualifier. The first return value is the schema name, or
+// empty string if none was specified; the second return value is the table name.
+func (n *ObjectName) SchemaAndTable() (string, string) {
+	if len(n.Qualifiers) > 0 {
+		return stripBackticks(n.Qualifiers[0]), stripBackticks(n.Name)
+	}
+	return "", stripBackticks(n.Name)
+}
+
+// Body slurps all body contents of a statement.
+type Body struct {
+	Contents string `parser:"(Word | String | Number | Operator)*"`
+}
+
+// Definer represents a user who is the definer of a routine or view.
+type Definer struct {
+	User string `parser:"((@String | @Word) '@'"`
+	Host string `parser:"(@String | @Word))"`
+	Func string `parser:"| ('CURRENT_USER' ('(' ')')?)"`
 }
 
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
-	Name *TableName `parser:"'CREATE' 'TABLE' ('IF' 'NOT' 'EXISTS')? @@ (Word | String | Number | Operator)*"`
+	Name ObjectName `parser:"'CREATE' 'TABLE' ('IF' 'NOT' 'EXISTS')? @@"`
+	Body Body       `parser:"@@"`
+}
+
+// CreateProc represents a CREATE PROCEDURE statement.
+type CreateProc struct {
+	Definer *Definer   `parser:"'CREATE' ('DEFINER' '=' @@)?"`
+	Name    ObjectName `parser:"'PROCEDURE' @@"`
+	Body    Body       `parser:"@@"`
+}
+
+// CreateFunc represents a CREATE FUNCTION statement.
+type CreateFunc struct {
+	Definer *Definer   `parser:"'CREATE' ('DEFINER' '=' @@)?"`
+	Name    ObjectName `parser:"'FUNCTION' @@"`
+	Body    Body       `parser:"@@"`
 }
 
 // Use represents a USE command.

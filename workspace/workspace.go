@@ -233,25 +233,25 @@ func ExecLogicalSchema(logicalSchema *fs.LogicalSchema, opts Options) (schema *t
 	}
 
 	// Run all CREATE TABLEs in parallel. Temporarily limit max open conns as a
-	// simple means of limiting concurrency
+	// simple means of limiting concurrency.
 	defer db.SetMaxOpenConns(0)
 	db.SetMaxOpenConns(10)
 	results := make(chan *StatementError)
-	for _, statement := range logicalSchema.CreateTables {
+	for _, stmt := range logicalSchema.Creates {
 		go func(statement *fs.Statement) {
 			results <- execStatement(db, statement)
-		}(statement)
+		}(stmt)
 	}
-	for range logicalSchema.CreateTables {
+	for range logicalSchema.Creates {
 		if result := <-results; result != nil {
 			statementErrors = append(statementErrors, result)
 		}
 	}
 	close(results)
 
-	// Run ALTER TABLEs sequentially, since foreign key manipulations don't play
+	// Run ALTERs sequentially, since foreign key manipulations don't play
 	// nice with concurrency.
-	for _, statement := range logicalSchema.AlterTables {
+	for _, statement := range logicalSchema.Alters {
 		if err := execStatement(db, statement); err != nil {
 			statementErrors = append(statementErrors, err)
 		}

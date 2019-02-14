@@ -1031,6 +1031,7 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 	for n, rawRoutine := range rawRoutines {
 		routines[n] = &Routine{
 			Name:              rawRoutine.Name,
+			Type:              ObjectType(strings.ToLower(rawRoutine.Type)),
 			Body:              rawRoutine.Body.String,
 			Definer:           rawRoutine.Definer,
 			DatabaseCollation: rawRoutine.DatabaseCollation,
@@ -1040,12 +1041,7 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 			SecurityType:      rawRoutine.SecurityType,
 			SQLMode:           rawRoutine.SQLMode,
 		}
-		switch strings.ToLower(rawRoutine.Type) {
-		case string(RoutineTypeProc):
-			routines[n].Type = RoutineTypeProc
-		case string(RoutineTypeFunc):
-			routines[n].Type = RoutineTypeFunc
-		default:
+		if routines[n].Type != ObjectTypeProc && routines[n].Type != ObjectTypeFunc {
 			return nil, fmt.Errorf("Unsupported routine type %s found in %s.%s", rawRoutine.Type, schema, rawRoutine.Name)
 		}
 	}
@@ -1071,7 +1067,7 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 				return fmt.Errorf("Error executing SHOW CREATE %s for %s.%s: %s", r.Type.Caps(), EscapeIdentifier(schema), EscapeIdentifier(r.Name), err)
 			}
 			var returnsClause string
-			if r.Type == RoutineTypeFunc {
+			if r.Type == ObjectTypeFunc {
 				returnsClause = " RETURNS ([^\n]+)"
 			}
 			reTemplate := fmt.Sprintf("^CREATE[^\n]* %s %s\\(([^\n]*)\\)%s\n", r.Type.Caps(), EscapeIdentifier(r.Name), returnsClause)
@@ -1081,7 +1077,7 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 				return fmt.Errorf("Failed to parse %s", r.CreateStatement)
 			}
 			r.ParamString = matches[1]
-			if r.Type == RoutineTypeFunc {
+			if r.Type == ObjectTypeFunc {
 				r.ReturnDataType = matches[2]
 			}
 			return nil
@@ -1090,9 +1086,9 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 	return routines, g.Wait()
 }
 
-func showCreateRoutine(db *sqlx.DB, routine string, rType RoutineType) (create string, err error) {
-	query := fmt.Sprintf("SHOW CREATE %s %s", rType.Caps(), EscapeIdentifier(routine))
-	if rType == RoutineTypeProc {
+func showCreateRoutine(db *sqlx.DB, routine string, ot ObjectType) (create string, err error) {
+	query := fmt.Sprintf("SHOW CREATE %s %s", ot.Caps(), EscapeIdentifier(routine))
+	if ot == ObjectTypeProc {
 		var createRows []struct {
 			CreateStatement sql.NullString `db:"Create Procedure"`
 		}
@@ -1102,7 +1098,7 @@ func showCreateRoutine(db *sqlx.DB, routine string, rType RoutineType) (create s
 		} else if err == nil {
 			create = createRows[0].CreateStatement.String
 		}
-	} else if rType == RoutineTypeFunc {
+	} else if ot == ObjectTypeFunc {
 		var createRows []struct {
 			CreateStatement sql.NullString `db:"Create Function"`
 		}
@@ -1113,7 +1109,7 @@ func showCreateRoutine(db *sqlx.DB, routine string, rType RoutineType) (create s
 			create = createRows[0].CreateStatement.String
 		}
 	} else {
-		err = fmt.Errorf("Unknown routine type %s", rType)
+		err = fmt.Errorf("Object type %s is not a routine", ot)
 	}
 	return
 }
