@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -27,6 +26,7 @@ const (
 	StatementTypeUse
 	StatementTypeCreate
 	StatementTypeAlter
+	StatementTypeDelimiter // the delimiter command, like in mysql command-line client
 	// Other types will be added once they are supported by the package
 )
 
@@ -44,6 +44,7 @@ type Statement struct {
 	ObjectName      string
 	ObjectQualifier string
 	FromFile        *TokenizedSQLFile
+	delimiter       string
 }
 
 // Location returns the file, line number, and character number where the
@@ -75,15 +76,19 @@ func (stmt *Statement) Schema() string {
 	return stmt.DefaultDatabase
 }
 
-var reSplitTextBody = regexp.MustCompile(`(\s*;?\s*)$`)
+// Body returns Text with any trailing delimiter and whitespace removed.
+func (stmt *Statement) Body() string {
+	body, _ := stmt.SplitTextBody()
+	return body
+}
 
-// SplitTextBody returns Text with its trailing semicolon and whitespace (if
+// SplitTextBody returns Text with its trailing delimiter and whitespace (if
 // any) separated out into a separate string.
 func (stmt *Statement) SplitTextBody() (body string, suffix string) {
-	// matches will always be a 2-elem slice, so no need to check for nil or len,
-	// since all strings inherently match the regexp
-	matches := reSplitTextBody.FindStringSubmatch(stmt.Text)
-	return stmt.Text[:len(stmt.Text)-len(matches[1])], matches[1]
+	body = strings.TrimRight(stmt.Text, "\n\t ")
+	body = strings.TrimSuffix(body, stmt.delimiter)
+	body = strings.TrimRight(body, "\n\t ")
+	return body, stmt.Text[len(body):]
 }
 
 // Remove removes the statement from the list of statements in stmt.FromFile.
@@ -114,6 +119,7 @@ type statementTokenizer struct {
 	inCComment      bool   // true if in a C-style comment
 	inQuote         rune   // nonzero if inside of a quoted string; value indicates which quote rune
 	defaultDatabase string // tracks most recent USE command
+	delimiter       string // statement delimiter, typically ";" or sometimes "//" for routines
 }
 
 type lineState struct {
@@ -127,8 +133,9 @@ type lineState struct {
 // reader into statements. The filePath is just used for cosmetic purposes.
 func newStatementTokenizer(reader io.Reader, filePath string) *statementTokenizer {
 	return &statementTokenizer{
-		reader:   bufio.NewReader(reader),
-		filePath: filePath,
+		reader:    bufio.NewReader(reader),
+		filePath:  filePath,
+		delimiter: ";",
 	}
 }
 
@@ -213,20 +220,34 @@ func (st *statementTokenizer) processLine(line string, eof bool) {
 			ls.inRelevant = true
 		}
 
+		delimFirstRune, delimFirstRuneLen := utf8.DecodeRuneInString(st.delimiter)
+		delimRuneCount := utf8.RuneCountInString(st.delimiter)
 		switch c {
-		case ';':
-			if ls.peekRune() == '\n' {
-				ls.nextRune()
-			}
-			ls.doneStatement(0)
 		case '\n':
 			// Commands do not require semicolons; newline alone can be delimiter.
-			// Only supported command so far is USE.
-			if strings.HasPrefix(strings.ToLower(ls.buf.String()), "use ") {
+			// Only supported commands so far are USE and DELIMITER.
+			lowerBufStr := strings.ToLower(ls.buf.String())
+			if strings.HasPrefix(lowerBufStr, "use ") || strings.HasPrefix(lowerBufStr, "delimiter ") {
 				ls.doneStatement(0)
 			}
 		case '"', '`', '\'':
 			ls.inQuote = c
+		case delimFirstRune:
+			// Multi-rune delimiter: peek ahead to see if we've matched the full
+			// delimiter. If so, slurp up the rest of the delimiter's runes.
+			if delimRuneCount > 1 {
+				if ls.peekRunes(delimRuneCount-1) != st.delimiter[delimFirstRuneLen:] {
+					break
+				}
+				for n := 0; n < delimRuneCount-1; n++ {
+					ls.nextRune()
+				}
+			}
+			// Slurp up a single trailing newline, if present
+			if ls.peekRune() == '\n' {
+				ls.nextRune()
+			}
+			ls.doneStatement(0)
 		}
 	}
 
@@ -258,6 +279,18 @@ func (ls *lineState) peekRune() rune {
 	return c
 }
 
+// peekRunes returns a string, made of at most n runes, from the current
+// position without advancing.
+func (ls *lineState) peekRunes(n int) string {
+	pos := ls.pos
+	for n > 0 && pos < len(ls.line) {
+		_, runeLen := utf8.DecodeRuneInString(ls.line[pos:])
+		pos += runeLen
+		n--
+	}
+	return ls.line[ls.pos:pos]
+}
+
 // beginStatement records the starting position of the next (not yet fully
 // tokenized) statement.
 func (ls *lineState) beginStatement() {
@@ -266,6 +299,7 @@ func (ls *lineState) beginStatement() {
 		LineNo:          ls.lineNo,
 		CharNo:          ls.charNo,
 		DefaultDatabase: ls.defaultDatabase,
+		delimiter:       ls.delimiter,
 	}
 }
 
@@ -291,7 +325,7 @@ func (ls *lineState) doneStatement(omitEndBytes int) {
 }
 
 func (ls *lineState) parseStatement() {
-	txt := strings.TrimRight(ls.stmt.Text, ";\n\t ")
+	txt, _ := ls.stmt.SplitTextBody()
 	if !ls.inRelevant || txt == "" {
 		ls.stmt.Type = StatementTypeNoop
 	} else {
@@ -301,6 +335,9 @@ func (ls *lineState) parseStatement() {
 		} else if sqlStatement.Use != nil {
 			ls.stmt.Type = StatementTypeUse
 			ls.defaultDatabase = stripBackticks(sqlStatement.Use.DefaultDatabase)
+		} else if sqlStatement.Delimiter != nil {
+			ls.stmt.Type = StatementTypeDelimiter
+			ls.delimiter = stripBackticks(sqlStatement.Delimiter.NewDelimiter) // TODO: unquote if quoted with ' or "
 		} else if sqlStatement.CreateTable != nil {
 			ls.stmt.Type = StatementTypeCreate
 			ls.stmt.ObjectType = tengo.ObjectTypeTable
@@ -325,6 +362,12 @@ func stripBackticks(input string) string {
 	return strings.Replace(input, "``", "`", -1)
 }
 
+// Note: this lexer and parser is not intended to line up 1:1 with SQL; its
+// purpose is simply to parse *statement types* and either *object names* or
+// *simple args*. The definition of Word intentionally matches keywords,
+// barewords, and backtick-quoted identifiers. The definition of Operator
+// intentionally matches several non-operator symbols in case they are used
+// as delimiters (via the delimiter command).
 var (
 	sqlLexer = lexer.Must(lexer.Regexp(`(#[^\n]+(?:\n|$))` +
 		`|(--\s[^\n]+(?:\n|$))` +
@@ -333,7 +376,7 @@ var (
 		"|(?P<Word>[0-9a-zA-Z$_]+|`(?:[^`]|``)+`)" +
 		`|(?P<String>'(?:[^']|''|\')*'|"(?:[^"]|""|\")*")` +
 		`|(?P<Number>[-+]?\d*\.?\d+([eE][-+]?\d+)?)` +
-		`|(?P<Operator><>|!=|<=|>=|[-+*/%,.()=<>@])`,
+		`|(?P<Operator><>|!=|<=|>=|[-+*/%,.()=<>@;~!^&])`,
 	))
 	nameParser = participle.MustBuild(&SQLStatement{},
 		participle.Lexer(sqlLexer),
@@ -348,6 +391,7 @@ type SQLStatement struct {
 	CreateProc  *CreateProc  `parser:"| @@"`
 	CreateFunc  *CreateFunc  `parser:"| @@"`
 	Use         *Use         `parser:"| @@"`
+	Delimiter   *Delimiter   `parser:"| @@"`
 }
 
 // ObjectName represents the name of an object, which may or may not be
@@ -403,4 +447,9 @@ type CreateFunc struct {
 // Use represents a USE command.
 type Use struct {
 	DefaultDatabase string `parser:"'USE' @Word"`
+}
+
+// Delimiter represents a DELIMITER command.
+type Delimiter struct {
+	NewDelimiter string `parser:"'DELIMITER' (@Word | @String | @Operator+)"`
 }

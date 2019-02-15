@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/skeema/skeema/fs"
 	"github.com/skeema/skeema/util"
 	"github.com/skeema/tengo"
 )
@@ -110,6 +111,13 @@ func NewDDLStatement(diff tengo.ObjectDiff, mods tengo.StatementModifiers, targe
 		ddl.connectParams = "foreign_key_checks=1"
 	}
 
+	// If creating a routine, use the server's global sql_mode instead of Skeema's
+	// normal built-in override
+	if wrapper == "" && (otype == tengo.ObjectTypeProc || otype == tengo.ObjectTypeFunc) &&
+		diff.DiffType() == tengo.DiffTypeCreate {
+		ddl.connectParams = "sql_mode=@@GLOBAL.sql_mode"
+	}
+
 	// Apply wrapper if relevant
 	if wrapper != "" {
 		var socket, port, connOpts string
@@ -189,9 +197,9 @@ func (ddl *DDLStatement) IsShellOut() bool {
 // shortcut for "system" shellout.
 func (ddl *DDLStatement) String() string {
 	if ddl.IsShellOut() {
-		return fmt.Sprintf("\\! %s", ddl.shellOut)
+		return fmt.Sprintf("\\! %s\n", ddl.shellOut)
 	}
-	return fmt.Sprintf("%s;", ddl.stmt)
+	return fs.AddDelimiter(ddl.stmt)
 }
 
 // Execute runs the DDL statement, either by running a SQL query against a DB,

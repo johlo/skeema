@@ -199,9 +199,9 @@ func pullSchemaDir(dir *fs.Dir, instance *tengo.Instance, instSchema *tengo.Sche
 		if bytesWritten, err := file.Rewrite(); err != nil {
 			return err
 		} else if bytesWritten == 0 {
-			log.Infof("Deleted %s -- table no longer exists", file)
+			log.Infof("Deleted %s -- no longer exists", file)
 		} else {
-			log.Infof("Wrote %s (%d bytes) -- updated table definition", file, bytesWritten)
+			log.Infof("Wrote %s (%d bytes) -- updated definition", file, bytesWritten)
 		}
 	}
 
@@ -217,7 +217,7 @@ func pullSchemaDir(dir *fs.Dir, instance *tengo.Instance, instSchema *tengo.Sche
 			if key.Type == tengo.ObjectTypeTable && !dir.Config.GetBool("include-auto-inc") {
 				contents, _ = tengo.ParseCreateAutoInc(contents)
 			}
-			contents = fmt.Sprintf("%s;\n", contents)
+			contents = fs.AddDelimiter(contents)
 			if bytesWritten, wasNew, err := fs.AppendToFile(filePath, contents); err != nil {
 				return err
 			} else if wasNew {

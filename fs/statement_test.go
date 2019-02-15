@@ -37,7 +37,7 @@ func TestStatementSplitTextBody(t *testing.T) {
 		"USE some_db\n\n":                     {"USE some_db", "\n\n"},
 	}
 	for input, expected := range cases {
-		stmt := &Statement{Text: input}
+		stmt := &Statement{Text: input, delimiter: ";"}
 		actualBody, actualSuffix := stmt.SplitTextBody()
 		if actualBody != expected[0] || actualSuffix != expected[1] {
 			t.Errorf("SplitTextBody on %s: Expected %#v,%#v; found %#v,%#v", input, expected[0], expected[1], actualBody, actualSuffix)

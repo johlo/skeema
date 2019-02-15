@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 )
 
@@ -144,4 +145,17 @@ func AppendToFile(filePath, contents string) (bytesWritten int, created bool, er
 	}
 	newContents := fmt.Sprintf("%s%s%s", string(byteContents), whitespace, contents)
 	return len(newContents), false, ioutil.WriteFile(filePath, []byte(newContents), 0666)
+}
+
+var reIsMultiStatement = regexp.MustCompile(`(?is)begin.*;.*end`)
+
+// AddDelimiter takes the supplied string and appends a delimiter to the end.
+// If the supplied string is a multi-statement routine, delimiter commands will
+// be prepended and appended to the string appropriately.
+// TODO devise a way to avoid using special delimiter for single-routine files
+func AddDelimiter(stmt string) string {
+	if reIsMultiStatement.MatchString(stmt) {
+		return fmt.Sprintf("DELIMITER //\n%s//\nDELIMITER ;\n", stmt)
+	}
+	return fmt.Sprintf("%s;\n", stmt)
 }
