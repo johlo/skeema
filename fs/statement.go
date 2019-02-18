@@ -23,10 +23,9 @@ type StatementType int
 const (
 	StatementTypeUnknown StatementType = iota
 	StatementTypeNoop                  // entirely whitespace and/or comments
-	StatementTypeUse
+	StatementTypeCommand               // currently just USE or DELIMITER
 	StatementTypeCreate
 	StatementTypeAlter
-	StatementTypeDelimiter // the delimiter command, like in mysql command-line client
 	// Other types will be added once they are supported by the package
 )
 
@@ -38,7 +37,7 @@ type Statement struct {
 	LineNo          int
 	CharNo          int
 	Text            string
-	DefaultDatabase string // only populated if a StatementTypeUse was encountered
+	DefaultDatabase string // only populated if an explicit USE command was encountered
 	Type            StatementType
 	ObjectType      tengo.ObjectType
 	ObjectName      string
@@ -329,37 +328,52 @@ func (ls *lineState) parseStatement() {
 	if !ls.inRelevant || txt == "" {
 		ls.stmt.Type = StatementTypeNoop
 	} else {
-		sqlStatement := &SQLStatement{}
-		if err := nameParser.ParseString(txt, sqlStatement); err != nil {
+		sqlStmt := &sqlStatement{}
+		if err := nameParser.ParseString(txt, sqlStmt); err != nil {
 			return
-		} else if sqlStatement.Use != nil {
-			ls.stmt.Type = StatementTypeUse
-			ls.defaultDatabase = stripBackticks(sqlStatement.Use.DefaultDatabase)
-		} else if sqlStatement.Delimiter != nil {
-			ls.stmt.Type = StatementTypeDelimiter
-			ls.delimiter = stripBackticks(sqlStatement.Delimiter.NewDelimiter) // TODO: unquote if quoted with ' or "
-		} else if sqlStatement.CreateTable != nil {
+		} else if sqlStmt.UseCommand != nil {
+			ls.stmt.Type = StatementTypeCommand
+			ls.defaultDatabase = stripBackticks(sqlStmt.UseCommand.DefaultDatabase)
+		} else if sqlStmt.DelimiterCommand != nil {
+			ls.stmt.Type = StatementTypeCommand
+			ls.delimiter = stripAnyQuote(sqlStmt.DelimiterCommand.NewDelimiter)
+		} else if sqlStmt.CreateTable != nil {
 			ls.stmt.Type = StatementTypeCreate
 			ls.stmt.ObjectType = tengo.ObjectTypeTable
-			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStatement.CreateTable.Name.SchemaAndTable()
-		} else if sqlStatement.CreateProc != nil {
+			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStmt.CreateTable.Name.schemaAndTable()
+		} else if sqlStmt.CreateProc != nil {
 			ls.stmt.Type = StatementTypeCreate
 			ls.stmt.ObjectType = tengo.ObjectTypeProc
-			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStatement.CreateProc.Name.SchemaAndTable()
-		} else if sqlStatement.CreateFunc != nil {
+			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStmt.CreateProc.Name.schemaAndTable()
+		} else if sqlStmt.CreateFunc != nil {
 			ls.stmt.Type = StatementTypeCreate
 			ls.stmt.ObjectType = tengo.ObjectTypeFunc
-			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStatement.CreateFunc.Name.SchemaAndTable()
+			ls.stmt.ObjectQualifier, ls.stmt.ObjectName = sqlStmt.CreateFunc.Name.schemaAndTable()
 		}
 	}
 }
 
 func stripBackticks(input string) string {
-	if input[0] != '`' || input[len(input)-1] != '`' {
+	if len(input) < 2 || input[0] != '`' || input[len(input)-1] != '`' {
 		return input
 	}
 	input = input[1 : len(input)-1]
 	return strings.Replace(input, "``", "`", -1)
+}
+
+func stripAnyQuote(input string) string {
+	if len(input) < 2 || input[0] != input[len(input)-1] {
+		return input
+	}
+	if input[0] == '`' {
+		return stripBackticks(input)
+	} else if input[0] != '"' && input[0] != '\'' {
+		return input
+	}
+	quoteStr := input[0:1]
+	input = input[1 : len(input)-1]
+	input = strings.Replace(input, strings.Repeat(quoteStr, 2), quoteStr, -1)
+	return strings.Replace(input, fmt.Sprintf("\\%s", quoteStr), quoteStr, -1)
 }
 
 // Note: this lexer and parser is not intended to line up 1:1 with SQL; its
@@ -378,78 +392,78 @@ var (
 		`|(?P<Number>[-+]?\d*\.?\d+([eE][-+]?\d+)?)` +
 		`|(?P<Operator><>|!=|<=|>=|[-+*/%,.()=<>@;~!^&])`,
 	))
-	nameParser = participle.MustBuild(&SQLStatement{},
+	nameParser = participle.MustBuild(&sqlStatement{},
 		participle.Lexer(sqlLexer),
 		participle.CaseInsensitive("Word"),
 		participle.UseLookahead(10),
 	)
 )
 
-// SQLStatement is the top-level struct for the name parser.
-type SQLStatement struct {
-	CreateTable *CreateTable `parser:"@@"`
-	CreateProc  *CreateProc  `parser:"| @@"`
-	CreateFunc  *CreateFunc  `parser:"| @@"`
-	Use         *Use         `parser:"| @@"`
-	Delimiter   *Delimiter   `parser:"| @@"`
+// sqlStatement is the top-level struct for the name parser.
+type sqlStatement struct {
+	CreateTable      *createTable      `parser:"@@"`
+	CreateProc       *createProc       `parser:"| @@"`
+	CreateFunc       *createFunc       `parser:"| @@"`
+	UseCommand       *useCommand       `parser:"| @@"`
+	DelimiterCommand *delimiterCommand `parser:"| @@"`
 }
 
-// ObjectName represents the name of an object, which may or may not be
+// objectName represents the name of an object, which may or may not be
 // backtick-wrapped, and may or may not have multiple qualifier parts (each
 // also potentially backtick-wrapped).
-type ObjectName struct {
+type objectName struct {
 	Qualifiers []string `parser:"(@Word '.')*"`
 	Name       string   `parser:"@Word"`
 }
 
-// SchemaAndTable interprets the ObjectName as a table name which may optionally
+// schemaAndTable interprets the ObjectName as a table name which may optionally
 // have a schema name qualifier. The first return value is the schema name, or
 // empty string if none was specified; the second return value is the table name.
-func (n *ObjectName) SchemaAndTable() (string, string) {
+func (n *objectName) schemaAndTable() (string, string) {
 	if len(n.Qualifiers) > 0 {
 		return stripBackticks(n.Qualifiers[0]), stripBackticks(n.Name)
 	}
 	return "", stripBackticks(n.Name)
 }
 
-// Body slurps all body contents of a statement.
-type Body struct {
+// body slurps all body contents of a statement.
+type body struct {
 	Contents string `parser:"(Word | String | Number | Operator)*"`
 }
 
-// Definer represents a user who is the definer of a routine or view.
-type Definer struct {
+// definer represents a user who is the definer of a routine or view.
+type definer struct {
 	User string `parser:"((@String | @Word) '@'"`
 	Host string `parser:"(@String | @Word))"`
 	Func string `parser:"| ('CURRENT_USER' ('(' ')')?)"`
 }
 
-// CreateTable represents a CREATE TABLE statement.
-type CreateTable struct {
-	Name ObjectName `parser:"'CREATE' 'TABLE' ('IF' 'NOT' 'EXISTS')? @@"`
-	Body Body       `parser:"@@"`
+// createTable represents a CREATE TABLE statement.
+type createTable struct {
+	Name objectName `parser:"'CREATE' 'TABLE' ('IF' 'NOT' 'EXISTS')? @@"`
+	Body body       `parser:"@@"`
 }
 
-// CreateProc represents a CREATE PROCEDURE statement.
-type CreateProc struct {
-	Definer *Definer   `parser:"'CREATE' ('DEFINER' '=' @@)?"`
-	Name    ObjectName `parser:"'PROCEDURE' @@"`
-	Body    Body       `parser:"@@"`
+// createProc represents a CREATE PROCEDURE statement.
+type createProc struct {
+	Definer *definer   `parser:"'CREATE' ('DEFINER' '=' @@)?"`
+	Name    objectName `parser:"'PROCEDURE' @@"`
+	Body    body       `parser:"@@"`
 }
 
-// CreateFunc represents a CREATE FUNCTION statement.
-type CreateFunc struct {
-	Definer *Definer   `parser:"'CREATE' ('DEFINER' '=' @@)?"`
-	Name    ObjectName `parser:"'FUNCTION' @@"`
-	Body    Body       `parser:"@@"`
+// createFunc represents a CREATE FUNCTION statement.
+type createFunc struct {
+	Definer *definer   `parser:"'CREATE' ('DEFINER' '=' @@)?"`
+	Name    objectName `parser:"'FUNCTION' @@"`
+	Body    body       `parser:"@@"`
 }
 
-// Use represents a USE command.
-type Use struct {
+// useCommand represents a USE command.
+type useCommand struct {
 	DefaultDatabase string `parser:"'USE' @Word"`
 }
 
-// Delimiter represents a DELIMITER command.
-type Delimiter struct {
+// delimiterCommand represents a DELIMITER command.
+type delimiterCommand struct {
 	NewDelimiter string `parser:"'DELIMITER' (@Word | @String | @Operator+)"`
 }

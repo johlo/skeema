@@ -75,7 +75,7 @@ func (lc *lintCounters) exitValue() error {
 func lintWalker(dir *fs.Dir, lc *lintCounters, maxDepth int) error {
 	log.Infof("Linting %s", dir)
 	if len(dir.IgnoredStatements) > 0 {
-		log.Warnf("Ignoring %d non-CREATE TABLE statements found in this directory's *.sql files", len(dir.IgnoredStatements))
+		log.Warnf("Ignoring %d unsupported or unparseable statements found in this directory's *.sql files", len(dir.IgnoredStatements))
 	}
 
 	ignoreTable, err := dir.Config.GetRegexp("ignore-table")
@@ -129,7 +129,7 @@ func lintWalker(dir *fs.Dir, lc *lintCounters, maxDepth int) error {
 		// TABLE and the table name matches ignore-table
 		for _, stmtErr := range statementErrors {
 			if stmtErr.ObjectType == tengo.ObjectTypeTable && ignoreTable != nil && ignoreTable.MatchString(stmtErr.ObjectName) {
-				log.Debugf("Skipping table %s because ignore-table='%s'", stmtErr.ObjectName, ignoreTable)
+				log.Debugf("Skipping %s because ignore-table='%s'", stmtErr.ObjectKey(), ignoreTable)
 				continue
 			}
 			log.Error(stmtErr.Error())
