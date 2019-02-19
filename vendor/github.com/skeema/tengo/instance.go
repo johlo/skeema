@@ -994,10 +994,9 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 		return nil, err
 	}
 
-	// Note on these queries: MySQL 8.0 changes information_schema column names to
+	// Note on this query: MySQL 8.0 changes information_schema column names to
 	// come back from queries in all caps, so we need to explicitly use AS clauses
 	// in order to get them back as lowercase and have sqlx Select() work
-
 	// Obtain the routines in the schema
 	var rawRoutines []struct {
 		Name              string         `db:"routine_name"`
@@ -1028,11 +1027,12 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 		return []*Routine{}, nil
 	}
 	routines := make([]*Routine, len(rawRoutines))
+	dict := make(map[ObjectKey]*Routine, len(rawRoutines))
 	for n, rawRoutine := range rawRoutines {
 		routines[n] = &Routine{
 			Name:              rawRoutine.Name,
 			Type:              ObjectType(strings.ToLower(rawRoutine.Type)),
-			Body:              rawRoutine.Body.String,
+			Body:              rawRoutine.Body.String, // This contains incorrect formatting conversions; overwritten later
 			Definer:           rawRoutine.Definer,
 			DatabaseCollation: rawRoutine.DatabaseCollation,
 			Comment:           rawRoutine.Comment,
@@ -1044,23 +1044,54 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 		if routines[n].Type != ObjectTypeProc && routines[n].Type != ObjectTypeFunc {
 			return nil, fmt.Errorf("Unsupported routine type %s found in %s.%s", rawRoutine.Type, schema, rawRoutine.Name)
 		}
+		key := ObjectKey{Type: routines[n].Type, Name: routines[n].Name}
+		dict[key] = routines[n]
 	}
 
-	// Obtain actual SHOW CREATE output, and parse it to hydrate ParamString and
-	// ReturnDataType. This removes the need to query information_schema.params
-	// and conditionally combine various datatype-specific modifiers. It's also
-	// the only way to retrieve the param string formatted in the same way as at
-	// creation time.
-	// Since there's no way in MySQL to bulk fetch this for multiple routines at
-	// once, use multiple goroutines to make this faster.
+	// Obtain param string, return type string, and full create statement:
+	// We can't rely only on information_schema, since it doesn't have the param
+	// string formatted in the same way as the original CREATE, nor does
+	// routines.body handle strings/charsets correctly for re-runnable SQL.
+	// In flavors without the new data dictionary, we first try querying mysql.proc
+	// to bulk-fetch sufficient info to rebuild the CREATE without needing to run
+	// a SHOW CREATE per routine.
+	// If mysql.proc doesn't exist or that query fails, we then run a SHOW CREATE
+	// per routine, using multiple goroutines for performance reasons.
 	db, err = instance.Connect(schema, "")
 	if err != nil {
 		return nil, err
+	}
+	if !instance.Flavor().HasDataDictionary() {
+		var rawRoutineMeta []struct {
+			Name      string `db:"name"`
+			Type      string `db:"type"`
+			Body      string `db:"body"`
+			ParamList string `db:"param_list"`
+			Returns   string `db:"returns"`
+		}
+		query := `
+			SELECT name, type, body, param_list, returns
+			FROM   mysql.proc
+			WHERE  db = ?`
+		// Errors here are non-fatal. No need to even check; slice will be empty which is fine
+		db.Select(&rawRoutineMeta, query, schema)
+		for _, meta := range rawRoutineMeta {
+			key := ObjectKey{Type: ObjectType(strings.ToLower(meta.Type)), Name: meta.Name}
+			if routine, ok := dict[key]; ok {
+				routine.ParamString = meta.ParamList
+				routine.ReturnDataType = meta.Returns
+				routine.Body = meta.Body
+				routine.CreateStatement = routine.Definition(instance.Flavor())
+			}
+		}
 	}
 	defer db.SetMaxOpenConns(0)
 	db.SetMaxOpenConns(10)
 	var g errgroup.Group
 	for _, r := range routines {
+		if r.CreateStatement != "" {
+			continue // already hydrated from mysql.proc query above
+		}
 		r := r
 		g.Go(func() (err error) {
 			if r.CreateStatement, err = showCreateRoutine(db, r.Name, r.Type); err != nil {
@@ -1079,6 +1110,10 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 			r.ParamString = matches[1]
 			if r.Type == ObjectTypeFunc {
 				r.ReturnDataType = matches[2]
+			}
+			// Attempt to replace r.Body with one that doesn't have character conversion problems
+			if header := r.head(instance.Flavor()); strings.HasPrefix(r.CreateStatement, header) {
+				r.Body = r.CreateStatement[len(header):]
 			}
 			return nil
 		})

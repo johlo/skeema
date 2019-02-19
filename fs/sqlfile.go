@@ -7,6 +7,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/skeema/tengo"
 )
 
 // SQLFile represents a file containing zero or more SQL statements.
@@ -64,15 +66,45 @@ func (sf SQLFile) Delete() error {
 // whitespace, since any comments and/or whitespace between SQL statements gets
 // split into separate Statement values.
 func (sf SQLFile) Tokenize() (*TokenizedSQLFile, error) {
-	file, err := os.Open(sf.Path())
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	tokenizer := newStatementTokenizer(file, sf.Path())
+	tokenizer := newStatementTokenizer(sf.Path(), ";")
 	statements, err := tokenizer.statements()
 	if err != nil {
 		return nil, err
+	}
+
+	// As a special case, if a file contains a single routine but no DELIMITER
+	// command, re-parse it as a single statement. This avoids user error from
+	// lack of DELIMITER usage in a multi-statement routine.
+	tryReparse := true
+	var seenRoutine, unknownAfterRoutine bool
+	for _, stmt := range statements {
+		switch stmt.Type {
+		case StatementTypeNoop:
+			// nothing to do for StatementTypeNoop, just excluding it from the default case
+		case StatementTypeCreate:
+			if !seenRoutine &&
+				(stmt.ObjectType == tengo.ObjectTypeProc || stmt.ObjectType == tengo.ObjectTypeFunc) &&
+				strings.Contains(strings.ToLower(stmt.Text), "begin") {
+				seenRoutine = true
+			} else {
+				tryReparse = false
+			}
+		case StatementTypeUnknown:
+			if seenRoutine {
+				unknownAfterRoutine = true
+			}
+		default:
+			tryReparse = false
+		}
+		if !tryReparse {
+			break
+		}
+	}
+	if seenRoutine && unknownAfterRoutine && tryReparse {
+		tokenizer := newStatementTokenizer(sf.Path(), "\000")
+		if statements2, err := tokenizer.statements(); err == nil {
+			statements = statements2
+		}
 	}
 	return NewTokenizedSQLFile(sf, statements), nil
 }

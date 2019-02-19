@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -106,8 +107,8 @@ func (stmt *Statement) Remove() {
 }
 
 type statementTokenizer struct {
-	reader   *bufio.Reader
-	filePath string // human-readable file path, just used for cosmetic purposes
+	filePath  string
+	delimiter string // statement delimiter, typically ";" or sometimes "//" for routines
 
 	result []*Statement // completed statements
 	stmt   *Statement   // tracking current (not yet completely tokenized) statement
@@ -118,7 +119,6 @@ type statementTokenizer struct {
 	inCComment      bool   // true if in a C-style comment
 	inQuote         rune   // nonzero if inside of a quoted string; value indicates which quote rune
 	defaultDatabase string // tracks most recent USE command
-	delimiter       string // statement delimiter, typically ";" or sometimes "//" for routines
 }
 
 type lineState struct {
@@ -129,20 +129,25 @@ type lineState struct {
 }
 
 // newStatementTokenizer creates a tokenizer for splitting the contents of the
-// reader into statements. The filePath is just used for cosmetic purposes.
-func newStatementTokenizer(reader io.Reader, filePath string) *statementTokenizer {
+// file at the supplied path into statements.
+func newStatementTokenizer(filePath, delimiter string) *statementTokenizer {
 	return &statementTokenizer{
-		reader:    bufio.NewReader(reader),
 		filePath:  filePath,
-		delimiter: ";",
+		delimiter: delimiter,
 	}
 }
 
 func (st *statementTokenizer) statements() ([]*Statement, error) {
-	var err error
+	file, err := os.Open(st.filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+
 	for err != io.EOF {
 		var line string
-		line, err = st.reader.ReadString('\n')
+		line, err = reader.ReadString('\n')
 		if err != nil && err != io.EOF {
 			return st.result, err
 		}

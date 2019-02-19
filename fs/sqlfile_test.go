@@ -116,6 +116,48 @@ func TestSQLFileTokenize(t *testing.T) {
 	if _, err := sf2.Tokenize(); err == nil {
 		t.Error("Expected to get an error about nonexistent file, but err was nil")
 	}
+
+	// Test handling of files that just contain a single routine definition, but
+	// without using the DELIMITER command
+	nd1 := SQLFile{
+		Dir:      "../testdata",
+		FileName: "nodelimiter1.sql",
+	}
+	if tokenizedFile, err := nd1.Tokenize(); err != nil {
+		t.Errorf("Unexpected error parsing nodelimiter1.sql: %s", err)
+	} else {
+		if len(tokenizedFile.Statements) == 2 {
+			if tokenizedFile.Statements[0].Type != StatementTypeNoop || tokenizedFile.Statements[1].Type != StatementTypeCreate {
+				t.Error("Correct count of statements found, but incorrect types parsed")
+			}
+		} else {
+			t.Errorf("Expected file to contain 2 statements, instead found %d", len(tokenizedFile.Statements))
+		}
+	}
+
+	// Now try parsing a file that contains a multi-line routine (but no DELIMITER
+	// command) followed by another CREATE, and confirm the parsing is "incorrect"
+	// in the expected way
+	nd2 := SQLFile{
+		Dir:      "../testdata",
+		FileName: "nodelimiter2.sql",
+	}
+	if tokenizedFile, err := nd2.Tokenize(); err != nil {
+		t.Errorf("Unexpected error parsing nodelimiter1.sql: %s", err)
+	} else {
+		if len(tokenizedFile.Statements) != 8 {
+			t.Errorf("Expected file to contain 8 statements, instead found %d", len(tokenizedFile.Statements))
+		}
+		var seenUnknown bool
+		for _, stmt := range tokenizedFile.Statements {
+			if stmt.Type == StatementTypeUnknown {
+				seenUnknown = true
+			}
+		}
+		if !seenUnknown {
+			t.Error("Expected to find a statement that could not be parsed, but did not")
+		}
+	}
 }
 
 func TestTokenizedSQLFileRewrite(t *testing.T) {

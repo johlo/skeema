@@ -22,9 +22,14 @@ type Routine struct {
 	CreateStatement   string // complete SHOW CREATE obtained from an instance
 }
 
-// Definition generates and returns a CREATE PROCEDURE or CREATE FUNCTION
-// statement based on the Routine's Go field values.
-func (r *Routine) Definition(_ Flavor) string {
+// Definition generates and returns a canonical CREATE PROCEDURE or CREATE
+// FUNCTION statement based on the Routine's Go field values.
+func (r *Routine) Definition(flavor Flavor) string {
+	return fmt.Sprintf("%s%s", r.head(flavor), r.Body)
+}
+
+// head returns the portion of a CREATE statement prior to the body.
+func (r *Routine) head(_ Flavor) string {
 	var definer, returnClause, characteristics string
 
 	atPos := strings.LastIndex(r.Definer, "@")
@@ -50,14 +55,13 @@ func (r *Routine) Definition(_ Flavor) string {
 	}
 	characteristics = strings.Join(clauses, "")
 
-	return fmt.Sprintf("CREATE DEFINER=%s %s %s(%s)%s\n%s%s",
+	return fmt.Sprintf("CREATE DEFINER=%s %s %s(%s)%s\n%s",
 		definer,
 		r.Type.Caps(),
 		EscapeIdentifier(r.Name),
 		r.ParamString,
 		returnClause,
-		characteristics,
-		r.Body)
+		characteristics)
 }
 
 // Equals returns true if two routines are identical, false otherwise.
